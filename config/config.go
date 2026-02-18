@@ -4,20 +4,35 @@ package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 )
 
+// BrokerConfig represents a single MQTT broker configuration
+type BrokerConfig struct {
+	Broker     string   `json:"broker"`
+	Port       string   `json:"port"`
+	Username   string   `json:"username,omitempty"`
+	Password   string   `json:"password,omitempty"`
+	Topics     []string `json:"topics"`
+	OutputFile string   `json:"output_file,omitempty"` // Optional: separate file for this broker
+}
+
+// Config represents the application configuration
 type Config struct {
-	Broker   string
-	Port     string
-	GateID   string
-	Topics   []string
-	Username string
-	Password string
-	Detailed bool
-	LogFile  string
+	Brokers  []BrokerConfig `json:"brokers,omitempty"` // New: multiple brokers
+	Detailed bool           `json:"detailed,omitempty"`
+
+	// Legacy single-broker fields (for backward compatibility)
+	Broker   string   `json:"-"`
+	Port     string   `json:"-"`
+	GateID   string   `json:"-"`
+	Topics   []string `json:"-"`
+	Username string   `json:"-"`
+	Password string   `json:"-"`
+	LogFile  string   `json:"-"`
 }
 
 func loadEnvFile(filename string) {
@@ -54,51 +69,153 @@ func LoadConfig() *Config {
 	// Load .env file first
 	loadEnvFile(".env")
 
-	// Default log file to logs/mqtt.log if LOG_FILE is set but empty, or use provided value
-	logFileEnv := getEnv("LOG_FILE", "")
-	switch logFileEnv {
-	case "":
-		logFileEnv = "" // No logging by default
-	case "true", "1":
-		// If LOG_FILE is just "true" or "1", use default path
-		logFileEnv = "mqtt.log"
-	}
-
 	cfg := &Config{
-		Broker:   getEnv("MQTT_BROKER", "localhost"),
-		Port:     getEnv("MQTT_PORT", "1883"),
-		GateID:   getEnv("GATE_ID", ""),
-		Username: getEnv("MQTT_USERNAME", ""),
-		Password: getEnv("MQTT_PASSWORD", ""),
 		Detailed: getEnv("DETAILED", "false") == "true",
-		LogFile:  logFileEnv,
 	}
 
-	// Load topics from env
-	topicsEnv := getEnv("MQTT_TOPICS", "")
-	if topicsEnv != "" {
-		cfg.Topics = strings.Split(topicsEnv, ",")
-		for i := range cfg.Topics {
-			cfg.Topics[i] = strings.TrimSpace(cfg.Topics[i])
+	// Try to load from JSON config file first
+	configFile := getEnv("CONFIG_FILE", "config.json")
+	if data, err := os.ReadFile(configFile); err == nil {
+		if err := json.Unmarshal(data, cfg); err == nil && len(cfg.Brokers) > 0 {
+			// Successfully loaded from JSON, validate and return
+			cfg = validateAndNormalizeConfig(cfg)
+			return cfg
 		}
 	}
 
-	// If gate_id is provided, generate topics
-	if cfg.GateID != "" {
-		gateTopics := []string{
-			fmt.Sprintf("%s_localfirst", cfg.GateID),
-			fmt.Sprintf("%s_parkbox", cfg.GateID),
-			fmt.Sprintf("%s_status", cfg.GateID),
-			fmt.Sprintf("%s_events", cfg.GateID),
+	// Fall back to environment variables (backward compatibility + new multi-broker support)
+	cfg = loadConfigFromEnv()
+	return cfg
+}
+
+// validateAndNormalizeConfig validates and normalizes broker configurations
+func validateAndNormalizeConfig(cfg *Config) *Config {
+	for i := range cfg.Brokers {
+		broker := &cfg.Brokers[i]
+
+		// Set defaults
+		if broker.Port == "" {
+			broker.Port = "1883"
 		}
-		cfg.Topics = append(cfg.Topics, gateTopics...)
+
+		// Default wildcard if no topics specified
+		if len(broker.Topics) == 0 {
+			broker.Topics = []string{"#"}
+		}
+
+		// Trim spaces from topics
+		for j := range broker.Topics {
+			broker.Topics[j] = strings.TrimSpace(broker.Topics[j])
+		}
+	}
+	return cfg
+}
+
+// loadConfigFromEnv loads configuration from environment variables
+func loadConfigFromEnv() *Config {
+	cfg := &Config{
+		Detailed: getEnv("DETAILED", "false") == "true",
 	}
 
-	// Default wildcard if no topics specified
-	if len(cfg.Topics) == 0 {
-		cfg.Topics = []string{"#"}
+	// Check for multi-broker configuration
+	// Format: BROKER_1_HOST, BROKER_1_PORT, BROKER_1_TOPICS, BROKER_1_OUTPUT_FILE, etc.
+	brokerIndex := 1
+	var brokers []BrokerConfig
+
+	for {
+		brokerHost := getEnv(fmt.Sprintf("BROKER_%d_HOST", brokerIndex), "")
+		if brokerHost == "" {
+			break // No more brokers
+		}
+
+		broker := BrokerConfig{
+			Broker:     brokerHost,
+			Port:       getEnv(fmt.Sprintf("BROKER_%d_PORT", brokerIndex), "1883"),
+			Username:   getEnv(fmt.Sprintf("BROKER_%d_USERNAME", brokerIndex), ""),
+			Password:   getEnv(fmt.Sprintf("BROKER_%d_PASSWORD", brokerIndex), ""),
+			OutputFile: getEnv(fmt.Sprintf("BROKER_%d_OUTPUT_FILE", brokerIndex), ""),
+		}
+
+		// Load topics
+		topicsEnv := getEnv(fmt.Sprintf("BROKER_%d_TOPICS", brokerIndex), "")
+		if topicsEnv != "" {
+			broker.Topics = strings.Split(topicsEnv, ",")
+			for i := range broker.Topics {
+				broker.Topics[i] = strings.TrimSpace(broker.Topics[i])
+			}
+		}
+
+		// Check for gate_id for this broker
+		gateID := getEnv(fmt.Sprintf("BROKER_%d_GATE_ID", brokerIndex), "")
+		if gateID != "" {
+			gateTopics := []string{
+				fmt.Sprintf("%s_localfirst", gateID),
+				fmt.Sprintf("%s_parkbox", gateID),
+				fmt.Sprintf("%s_status", gateID),
+				fmt.Sprintf("%s_events", gateID),
+			}
+			broker.Topics = append(broker.Topics, gateTopics...)
+		}
+
+		// Default wildcard if no topics specified
+		if len(broker.Topics) == 0 {
+			broker.Topics = []string{"#"}
+		}
+
+		brokers = append(brokers, broker)
+		brokerIndex++
 	}
 
+	// If no multi-broker config found, fall back to legacy single-broker format
+	if len(brokers) == 0 {
+		broker := BrokerConfig{
+			Broker:   getEnv("MQTT_BROKER", "localhost"),
+			Port:     getEnv("MQTT_PORT", "1883"),
+			Username: getEnv("MQTT_USERNAME", ""),
+			Password: getEnv("MQTT_PASSWORD", ""),
+		}
+
+		// Legacy log file handling
+		logFileEnv := getEnv("LOG_FILE", "")
+		switch logFileEnv {
+		case "":
+			broker.OutputFile = ""
+		case "true", "1":
+			broker.OutputFile = "mqtt.log"
+		default:
+			broker.OutputFile = logFileEnv
+		}
+
+		// Load topics from env
+		topicsEnv := getEnv("MQTT_TOPICS", "")
+		if topicsEnv != "" {
+			broker.Topics = strings.Split(topicsEnv, ",")
+			for i := range broker.Topics {
+				broker.Topics[i] = strings.TrimSpace(broker.Topics[i])
+			}
+		}
+
+		// If gate_id is provided, generate topics
+		gateID := getEnv("GATE_ID", "")
+		if gateID != "" {
+			gateTopics := []string{
+				fmt.Sprintf("%s_localfirst", gateID),
+				fmt.Sprintf("%s_parkbox", gateID),
+				fmt.Sprintf("%s_status", gateID),
+				fmt.Sprintf("%s_events", gateID),
+			}
+			broker.Topics = append(broker.Topics, gateTopics...)
+		}
+
+		// Default wildcard if no topics specified
+		if len(broker.Topics) == 0 {
+			broker.Topics = []string{"#"}
+		}
+
+		brokers = append(brokers, broker)
+	}
+
+	cfg.Brokers = brokers
 	return cfg
 }
 
