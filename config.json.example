@@ -1,0 +1,37 @@
+{
+  "detailed": true,
+  "brokers": [
+    {
+      "broker": "172.27.59.101",
+      "port": "8883",
+      "username": "user1",
+      "password": "pass1",
+      "topics": [
+        "2309_tag_status",
+        "2309_dashboard"
+      ],
+      "output_file": "broker1.log"
+    },
+    {
+      "broker": "172.27.66.110",
+      "port": "8883",
+      "username": "user2",
+      "password": "pass2",
+      "topics": [
+        "2428_dashboard",
+        "2428__dashboard"
+      ],
+      "output_file": "broker2.log"
+    },
+    {
+      "broker": "localhost",
+      "port": "1883",
+      "topics": [
+        "sensors/#",
+        "alerts/+"
+      ],
+      "output_file": "local-broker.log"
+    }
+  ]
+}
+
